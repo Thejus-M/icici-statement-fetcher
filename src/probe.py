@@ -409,97 +409,12 @@ def card_details(text: str) -> dict:
     return found
 
 
-# ICICI asks for an OTP to go past the card summary (the statement tabs
-# were never "missing" — the page was sitting on an OTP step we never
-# answered, and the session died waiting). The field is sometimes one box
-# and sometimes six single-character ones.
-_OTP_FIELD = ("input[type=tel], input[formcontrolname*=otp i], input[id*=otp i], "
-              "input[name*=otp i], input[aria-label*='otp' i], input[maxlength='1']")
-_OTP_WANTED = re.compile(r"\botp\b|one[- ]time password|verification code", re.I)
-# Not anchored: the live button's wording is unknown, and an anchored
-# match found nothing last run. Checked against the dialog's own buttons.
-_OTP_SUBMIT = re.compile(r"submit|verify|validate|confirm|continue|proceed|done", re.I)
-# Long enough to find the phone, read the message and type it in.
-_OTP_TIMEOUT = float(os.environ.get("ICICI_OTP_TIMEOUT", "180"))
-
-
-def answer_otp(page, where: str = "") -> bool:
-    """If the page is asking for an OTP, ask you for it and type it in.
-
-    Returns True when one was entered. The wait is yours, not the site's:
-    nothing else happens until you type it or the wait runs out, which is
-    the whole point — the previous runs walked on and lost the session.
-    """
-    if page.is_closed():
-        return False
-    fields = page.locator(_OTP_FIELD)
-    try:
-        visible = fields.locator("visible=true")
-        count = visible.count()
-    except PlaywrightError:
-        return False
-    if count == 0 or not _OTP_WANTED.search(_text(page)):
-        return False
-
-    print(f"\n  ICICI is asking for an OTP{' on ' + where if where else ''}.", flush=True)
-    # Flying blind on this dialog so far, so keep it: the field shapes and
-    # the button wording are what the next version needs.
-    _save(page, f"otp-{_slug(where) or 'prompt'}")
-    try:
-        shapes = visible.evaluate_all(
-            """els => els.slice(0, 8).map(e => ({tag: e.tagName.toLowerCase(), type: e.type || '',
-                 id: e.id || '', name: e.name || '', maxlength: e.getAttribute('maxlength') || '',
-                 label: e.getAttribute('aria-label') || e.getAttribute('placeholder') || ''}))""")
-        print(f"  fields: {shapes}", flush=True)
-        buttons = page.locator("button, [role=button], input[type=submit]").locator(
-            "visible=true").evaluate_all(
-            """els => els.slice(0, 12).map(e => (e.innerText || e.value || '').trim()).filter(Boolean)""")
-        print(f"  buttons on screen: {buttons}", flush=True)
-    except PlaywrightError:
-        buttons = []
-    code = read_line("  Type it here and press Enter: ", hidden=False, timeout=_OTP_TIMEOUT)
-    if not code:
-        print("  no OTP typed; carrying on without it.", flush=True)
-        return False
-    digits = re.sub(r"\D", "", code)
-
-    try:
-        if count >= len(digits) > 1:
-            # One box per digit: fill each, since typing into the first
-            # only advances if the site wires it that way.
-            for i, digit in enumerate(digits):
-                visible.nth(i).fill(digit)
-                page.wait_for_timeout(120)
-        else:
-            visible.first.fill(digits)
-        page.wait_for_timeout(500)
-
-        # Enter on the field itself first: after filling the last box the
-        # focus is there, and a dialog that submits on Enter needs nothing
-        # else. Then the dialog's own buttons, by wording.
-        pressed = "Enter on the field"
-        try:
-            visible.nth(min(count, len(digits)) - 1).press("Enter")
-        except (PlaywrightError, PlaywrightTimeoutError):
-            pressed = ""
-        page.wait_for_timeout(1500)
-
-        if _OTP_WANTED.search(_text(page)):  # still asking
-            submit = page.locator("button, [role=button], input[type=submit]").locator(
-                "visible=true").filter(has_text=_OTP_SUBMIT)
-            if submit.count() and _click(submit, "the OTP submit button"):
-                pressed = "a submit button"
-            else:
-                print(f"  nothing to submit with. Buttons seen: {buttons}", flush=True)
-                pressed = pressed or "nothing"
-        settle(page, 12)
-        _save(page, f"otp-{_slug(where) or 'prompt'}-after")
-        still = "still asking" if _OTP_WANTED.search(_text(page)) else "accepted"
-        print(f"  submitted with {pressed}: {still}; now at {page.url[:60]}", flush=True)
-        return True
-    except (PlaywrightError, PlaywrightTimeoutError) as exc:
-        print(f"  could not enter the OTP: {str(exc).splitlines()[0][:80]}", flush=True)
-        return False
+# No OTP step here, deliberately. Earlier runs kept hitting one, and it
+# turned out the probe summoned it itself by clicking the card page's eye
+# toggle, which unmasks the card number and expiry. Nothing this fetcher
+# needs is behind an OTP, so there is nothing to type: if a future page
+# does ask for one, add the step then, rather than carrying code for a
+# prompt that only ever fired by mistake.
 
 
 def settle(page, seconds: float = 8.0) -> None:
@@ -526,7 +441,6 @@ def capture_card_statements(page, summary: dict) -> None:
         print(f"    tab {pattern.pattern.strip('^$')}", flush=True)
         if _click(tab, name):
             settle(page, 6)
-            answer_otp(page, name)
             reveal_amounts(page)
             summary["pages"][name] = {**_save(page, name), "headings": _headings(page)}
 
@@ -632,8 +546,6 @@ def run() -> int:
                 if page.is_closed():
                     print("    the site closed the page on that click.", flush=True)
                     break
-                if answer_otp(page, name):
-                    summary.setdefault("otpSteps", []).append(name)
                 reveal_amounts(page)
                 summary["pages"][name] = {**_save(page, name), "headings": _headings(page),
                                           "links": _links(page)}
