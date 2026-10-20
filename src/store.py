@@ -8,8 +8,8 @@ TXDB_HOME = Path(os.environ.get("TXDB_HOME", "/home/pc/Work/omarchy-transactions
 if str(TXDB_HOME) not in sys.path:
     sys.path.insert(0, str(TXDB_HOME))
 
-from txdb import db, ingest, queries  # noqa: E402
-from txdb.cli import backup  # noqa: E402
+from txdb import db, ingest, queries  # noqa: E402,F401  (re-exported for callers)
+from txdb.cli import backup  # noqa: E402,F401  (re-exported for callers)
 
 _conn = None
 

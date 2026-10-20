@@ -59,6 +59,15 @@ def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "page"
 
 
+def _text(page) -> str:
+    """The page's visible text, or "" if the page has gone (the site closes
+    it on us often enough that every caller has to cope)."""
+    try:
+        return " ".join(page.locator("body").inner_text().split())
+    except PlaywrightError:
+        return ""
+
+
 def _save(page, name: str) -> dict:
     """HTML, a full-page screenshot and the visible text of one page."""
     config.ensure_output_dir()
@@ -75,14 +84,12 @@ def _save(page, name: str) -> dict:
         saved["png"] = base.with_suffix(".png").name
     except PlaywrightError as exc:
         print(f"  could not screenshot: {exc}", file=sys.stderr)
-    try:
-        text = " ".join(page.locator("body").inner_text().split())
+    text = _text(page)
+    if text:
         base.with_suffix(".txt").write_text(text, encoding="utf-8")
         saved["txt"] = base.with_suffix(".txt").name
         saved["amounts"] = sorted(set(_AMOUNT.findall(text)))[:40]
         saved["accountLike"] = sorted(set(_ACCOUNT_LIKE.findall(text)))[:20]
-    except PlaywrightError as exc:
-        print(f"  could not read text: {exc}", file=sys.stderr)
     return saved
 
 
@@ -512,7 +519,9 @@ def run() -> int:
                                           "links": _links(page)}
                 print(f"    now at {page.url[:80]}", flush=True)
                 if "credit-card" in page.url:
-                    summary["card"] = card_details(_text(page))
+                    captured = _text(page) or (config.OUTPUT_DIR / f"{name}.txt").read_text(
+                        encoding="utf-8", errors="replace")
+                    summary["card"] = card_details(captured)
                     capture_card_statements(page, summary)
 
             # Anything the site opened in a tab of its own.
@@ -524,6 +533,11 @@ def run() -> int:
         finally:
             (config.OUTPUT_DIR / "probe-summary.json").write_text(
                 json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+            # Printed here, not at the end of run(): the site closing the
+            # page mid-walk must not cost you the figures already read.
+            if summary.get("pages"):
+                print(f"\nSaved {len(summary['pages'])} pages to {config.OUTPUT_DIR}")
+                print_findings(summary)
             for target in (*extra_pages, page):
                 try:
                     if not target.is_closed():
@@ -536,8 +550,6 @@ def run() -> int:
             except PlaywrightError:
                 pass
 
-    print(f"\nSaved {len(summary['pages'])} pages to {config.OUTPUT_DIR}")
-    print_findings(summary)
     return 0
 
 
