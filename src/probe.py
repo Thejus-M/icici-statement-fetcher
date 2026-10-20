@@ -161,6 +161,16 @@ def open_qr_tab(page) -> bool:
 #   page dies.
 # * Balances are masked ("PORTFOLIO VALUE Rs •••") until an eye toggle is
 #   clicked.
+# * The nav is a **sidenav rendered twice** — a desktop copy and a tablet
+#   one (#sidenav / #sidenavNew, #menu-logo-tablet) — so a plain text match
+#   finds the hidden copy first and every click times out waiting for it to
+#   become visible. Each menu item therefore appeared twice in the second
+#   run's listing. Always take the visible match.
+# * Its items are bare <a> with neither href nor routerlink: Angular routes
+#   them in JS, so there is no URL to navigate to directly, and a click is
+#   the only way in. When Playwright refuses one (an overlay, a transition)
+#   the element's own .click() is dispatched instead, the same trick the
+#   HDFC fetcher uses for its sticky header.
 
 _REVEAL = "[class*=eye i], [aria-label*='show' i], [aria-label*='unmask' i]"
 
@@ -214,6 +224,40 @@ def reveal_amounts(page) -> int:
     return clicked
 
 
+def _visible(locator):
+    """The visible match, falling back to the first — the sidenav exists
+    twice over, and the hidden copy is the one text matching finds."""
+    try:
+        shown = locator.locator("visible=true")
+        if shown.count():
+            return shown.first
+    except PlaywrightError:
+        pass
+    return locator.first
+
+
+def _click(locator, what: str) -> bool:
+    """Click, and if Playwright will not (hidden, covered, mid-animation),
+    dispatch the element's own click. Returns whether either worked."""
+    target = _visible(locator)
+    try:
+        target.scroll_into_view_if_needed(timeout=3000)
+    except (PlaywrightError, PlaywrightTimeoutError):
+        pass
+    try:
+        target.click(timeout=6000)
+        return True
+    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+        print(f"    click refused ({str(exc).splitlines()[0][:60]}), dispatching it directly",
+              flush=True)
+    try:
+        target.evaluate("el => el.click()")
+        return True
+    except PlaywrightError as exc:
+        print(f"    could not click {what}: {str(exc).splitlines()[0][:70]}", flush=True)
+        return False
+
+
 def _menu_items(page) -> list:
     try:
         items = page.locator("[role=menuitem], [role=menu] a, .dropdown a, .submenu a, "
@@ -232,11 +276,15 @@ def open_menu(page, label: str) -> list:
         nav = page.get_by_text(re.compile(rf"^{re.escape(label)}$", re.I))
         if nav.count() == 0:
             return []
-        nav.first.hover(timeout=5000)
-        page.wait_for_timeout(700)
+        shown = _visible(nav)
+        try:
+            shown.hover(timeout=5000)
+            page.wait_for_timeout(700)
+        except (PlaywrightError, PlaywrightTimeoutError):
+            pass
         items = _menu_items(page)
         if not items:
-            nav.first.click(timeout=5000)
+            _click(nav, label)
             page.wait_for_timeout(1200)
             items = _menu_items(page)
         return items
@@ -251,8 +299,7 @@ def back_to_overview(page) -> bool:
         return False
     try:
         home = page.get_by_text(re.compile(r"^overview$", re.I))
-        if home.count():
-            home.first.click(timeout=8000)
+        if home.count() and _click(home, "OVERVIEW"):
             page.wait_for_timeout(2500)
             return True
     except (PlaywrightError, PlaywrightTimeoutError):
@@ -330,14 +377,15 @@ def run() -> int:
                 label = " ".join(link.first.inner_text().split())
                 name = f"quick-{_slug(label)}"
                 print(f"  opening {label!r}", flush=True)
-                try:
-                    link.first.click(timeout=8000)
-                    page.wait_for_timeout(4000)
+                if _click(link, label):
+                    page.wait_for_timeout(4500)
+                    if page.is_closed():
+                        print("    the site closed the page on that click.", flush=True)
+                        break
                     reveal_amounts(page)
                     summary["pages"][name] = {**_save(page, name), "headings": _headings(page),
                                               "links": _links(page)}
-                except (PlaywrightError, PlaywrightTimeoutError) as exc:
-                    print(f"    skipped: {str(exc).splitlines()[0][:90]}", flush=True)
+                    print(f"    now at {page.url[:80]}", flush=True)
                 back_to_overview(page)
 
             # Then each nav menu, and the item in it worth opening.
@@ -353,14 +401,18 @@ def run() -> int:
                     continue
                 name = f"menu-{_slug(label)}-{_slug(target)}"
                 print(f"    opening {target!r}", flush=True)
-                try:
-                    page.get_by_text(re.compile(rf"^{re.escape(target)}$", re.I)).first.click(timeout=8000)
-                    page.wait_for_timeout(4000)
+                # The open submenu's markup is worth keeping whether or not
+                # the click lands: it is where the real selectors live.
+                _save(page, f"{name}-menu-open")
+                if _click(page.get_by_text(re.compile(rf"^{re.escape(target)}$", re.I)), target):
+                    page.wait_for_timeout(4500)
+                    if page.is_closed():
+                        print("    the site closed the page on that click.", flush=True)
+                        break
                     reveal_amounts(page)
                     summary["pages"][name] = {**_save(page, name), "headings": _headings(page),
                                               "links": _links(page)}
-                except (PlaywrightError, PlaywrightTimeoutError) as exc:
-                    print(f"    skipped: {str(exc).splitlines()[0][:90]}", flush=True)
+                    print(f"    now at {page.url[:80]}", flush=True)
                 back_to_overview(page)
 
             # Anything the site opened in a tab of its own.
