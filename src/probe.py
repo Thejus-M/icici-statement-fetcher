@@ -64,11 +64,12 @@ def _save(page, name: str) -> dict:
     config.ensure_output_dir()
     base = config.OUTPUT_DIR / name
     saved = {}
-    try:
-        base.with_suffix(".html").write_text(page.content(), encoding="utf-8")
-        saved["html"] = base.with_suffix(".html").name
-    except PlaywrightError as exc:
-        print(f"  could not save HTML: {exc}", file=sys.stderr)
+    for suffix, produce in ((".html", page.content), ("-dom.html", lambda: _deep_html(page))):
+        try:
+            (config.OUTPUT_DIR / f"{name}{suffix}").write_text(produce(), encoding="utf-8")
+            saved[suffix.strip(".-")] = f"{name}{suffix}"
+        except PlaywrightError as exc:
+            print(f"  could not save {suffix}: {str(exc).splitlines()[0][:80]}", file=sys.stderr)
     try:
         page.screenshot(path=str(base.with_suffix(".png")), full_page=True)
         saved["png"] = base.with_suffix(".png").name
@@ -142,6 +143,123 @@ def open_qr_tab(page) -> bool:
         return False
 
 
+# --- what the first live run taught us ---------------------------------
+#
+# * The nav reads ACCOUNTS on screen but the markup says "Accounts": the
+#   uppercase is CSS, and innerText returns rendered text. Match nav items
+#   case-insensitively, never against the saved HTML's casing.
+# * The top nav items are **menus**, not links: clicking ACCOUNTS only
+#   opens a submenu, whose items ("Bank Accounts" …) are not in the markup
+#   until it is open, and the thing worth opening is inside it.
+# * page.content() on the overview is ~10 MB of inline CSS and JS, which is
+#   unreadable. Each page is also saved as a tag/attribute/text
+#   serialisation about 500x smaller (and that walker descends into shadow
+#   roots, should this app ever grow any).
+# * **Going back kills the session** — the first run lost the browser to a
+#   page.go_back(), exactly as HDFC does. This one never goes back: it
+#   returns to the overview by clicking OVERVIEW, and stops cleanly if the
+#   page dies.
+# * Balances are masked ("PORTFOLIO VALUE Rs •••") until an eye toggle is
+#   clicked.
+
+_REVEAL = "[class*=eye i], [aria-label*='show' i], [aria-label*='unmask' i]"
+
+# Each top-nav menu, and the item inside it worth opening.
+_ROUTES = [
+    ("ACCOUNTS", re.compile(r"bank account|account detail|saving", re.I)),
+    ("CARDS", re.compile(r"credit card|debit card|card detail", re.I)),
+    ("DEPOSITS", re.compile(r"fixed deposit|recurring", re.I)),
+]
+_QUICK_LINKS = [re.compile(r"^view statement$", re.I)]
+
+# A small, readable serialisation of the DOM: tags, attributes and text,
+# without the megabytes of inline CSS page.content() carries. Descends into
+# shadow roots too, which page.content() would drop.
+_DEEP_HTML_JS = """() => {
+  const walk = (node) => {
+    let out = '';
+    for (const child of node.children || []) {
+      const tag = child.tagName.toLowerCase();
+      const attrs = [...child.attributes].map(a => ` ${a.name}="${a.value}"`).join('');
+      out += `<${tag}${attrs}>`;
+      if (child.shadowRoot) out += `<!--shadow-->${walk(child.shadowRoot)}<!--/shadow-->`;
+      out += walk(child) || child.textContent || '';
+      out += `</${tag}>`;
+    }
+    return out;
+  };
+  return walk(document.body);
+}"""
+
+
+def _deep_html(page) -> str:
+    return page.evaluate(_DEEP_HTML_JS)
+
+
+def reveal_amounts(page) -> int:
+    """Clicks every mask toggle, so a capture holds figures rather than
+    "Rs •••". Returns how many it clicked."""
+    clicked = 0
+    try:
+        toggles = page.locator(_REVEAL)
+        for i in range(min(toggles.count(), 8)):
+            try:
+                toggles.nth(i).click(timeout=2500)
+                clicked += 1
+                page.wait_for_timeout(300)
+            except (PlaywrightError, PlaywrightTimeoutError):
+                continue
+    except PlaywrightError:
+        pass
+    return clicked
+
+
+def _menu_items(page) -> list:
+    try:
+        items = page.locator("[role=menuitem], [role=menu] a, .dropdown a, .submenu a, "
+                             "[class*=menu i] a, [class*=dropdown i] a").all_inner_texts()
+    except PlaywrightError:
+        return []
+    return [" ".join(i.split()) for i in items if i.strip()][:40]
+
+
+def open_menu(page, label: str) -> list:
+    """Opens a top-nav menu (hover first: several only open that way) and
+    returns the items it revealed."""
+    try:
+        # innerText is the rendered text, so "Accounts" in the markup
+        # arrives here as "ACCOUNTS"; match either.
+        nav = page.get_by_text(re.compile(rf"^{re.escape(label)}$", re.I))
+        if nav.count() == 0:
+            return []
+        nav.first.hover(timeout=5000)
+        page.wait_for_timeout(700)
+        items = _menu_items(page)
+        if not items:
+            nav.first.click(timeout=5000)
+            page.wait_for_timeout(1200)
+            items = _menu_items(page)
+        return items
+    except (PlaywrightError, PlaywrightTimeoutError):
+        return []
+
+
+def back_to_overview(page) -> bool:
+    """Never page.go_back(): the first run lost the session to it. Clicking
+    OVERVIEW is a real in-app navigation, which the site allows."""
+    if page.is_closed():
+        return False
+    try:
+        home = page.get_by_text(re.compile(r"^overview$", re.I))
+        if home.count():
+            home.first.click(timeout=8000)
+            page.wait_for_timeout(2500)
+            return True
+    except (PlaywrightError, PlaywrightTimeoutError):
+        pass
+    return False
+
+
 def wait_for_login(page) -> bool:
     """Blocks while you scan the QR. Returns False if the wait runs out."""
     budget = (f"{config.LOGIN_TIMEOUT / 60:.0f} minutes" if config.LOGIN_TIMEOUT >= 90
@@ -170,15 +288,17 @@ def wait_for_login(page) -> bool:
 
 def run() -> int:
     config.ensure_output_dir()
-    summary: dict = {"loginUrl": config.LOGIN_URL, "pages": {}}
+    summary: dict = {"loginUrl": config.LOGIN_URL, "pages": {}, "menus": {}}
+    extra_pages: list = []
 
     with sync_playwright() as playwright:
         browser = browser_mod.launch(playwright)
         context, page = browser_mod.new_page(browser)
-        # An ad or a "download the app" interstitial opening a second tab
-        # would otherwise steal the scan.
-        context.on("page", lambda p: p.close() if p != page else None)
+        # Keep tabs the site opens rather than closing them — a statement
+        # may well open in one — but never let one replace the main page.
+        context.on("page", lambda p: extra_pages.append(p))
         page.on("dialog", lambda d: d.dismiss())
+        page.on("close", lambda: print("  !! the site closed the main page", flush=True))
         page.set_default_timeout(30_000)
 
         try:
@@ -193,39 +313,71 @@ def run() -> int:
                 _save(page, "login-timeout")
                 return 1
 
-            print("\nSaving the landing page…", flush=True)
             summary["landingUrl"] = page.url
+            print(f"\nRevealing masked figures… {reveal_amounts(page)} toggles clicked", flush=True)
+            print("Saving the overview…", flush=True)
             summary["pages"]["landing"] = {
-                **_save(page, "landing"),
-                "headings": _headings(page),
-                "links": _links(page),
-            }
+                **_save(page, "landing"), "headings": _headings(page), "links": _links(page)}
 
-            # Follow the obvious ones (statements, transactions, account
-            # detail) one level deep. Each is saved under its own name and
-            # the run returns to the landing page afterwards.
-            for link in summary["pages"]["landing"]["links"][:6]:
-                name = f"page-{_slug(link['text'])}"
-                print(f"  opening {link['text']!r}", flush=True)
+            # Quick links first: "View Statement" is the shortest path to a
+            # transaction list.
+            for pattern in _QUICK_LINKS:
+                if page.is_closed():
+                    break
+                link = page.get_by_text(pattern)
+                if link.count() == 0:
+                    continue
+                label = " ".join(link.first.inner_text().split())
+                name = f"quick-{_slug(label)}"
+                print(f"  opening {label!r}", flush=True)
                 try:
-                    page.locator(link["selector"]).first.click(timeout=8000)
-                    page.wait_for_load_state("networkidle", timeout=15_000)
+                    link.first.click(timeout=8000)
+                    page.wait_for_timeout(4000)
+                    reveal_amounts(page)
+                    summary["pages"][name] = {**_save(page, name), "headings": _headings(page),
+                                              "links": _links(page)}
                 except (PlaywrightError, PlaywrightTimeoutError) as exc:
                     print(f"    skipped: {str(exc).splitlines()[0][:90]}", flush=True)
+                back_to_overview(page)
+
+            # Then each nav menu, and the item in it worth opening.
+            for label, wanted in _ROUTES:
+                if page.is_closed():
+                    print("  stopping: the session is gone.", flush=True)
+                    break
+                items = open_menu(page, label)
+                summary["menus"][label] = items
+                print(f"  {label}: {', '.join(items[:6]) or '(no items found)'}", flush=True)
+                target = next((i for i in items if wanted.search(i)), None)
+                if not target:
                     continue
-                summary["pages"][name] = {
-                    **_save(page, name), "headings": _headings(page), "url": page.url,
-                    "openedFrom": link["text"],
-                }
+                name = f"menu-{_slug(label)}-{_slug(target)}"
+                print(f"    opening {target!r}", flush=True)
                 try:
-                    page.go_back(wait_until="domcontentloaded", timeout=15_000)
-                    page.wait_for_timeout(1500)
-                except (PlaywrightError, PlaywrightTimeoutError):
-                    page.goto(summary["landingUrl"], wait_until="domcontentloaded")
-                    page.wait_for_timeout(1500)
+                    page.get_by_text(re.compile(rf"^{re.escape(target)}$", re.I)).first.click(timeout=8000)
+                    page.wait_for_timeout(4000)
+                    reveal_amounts(page)
+                    summary["pages"][name] = {**_save(page, name), "headings": _headings(page),
+                                              "links": _links(page)}
+                except (PlaywrightError, PlaywrightTimeoutError) as exc:
+                    print(f"    skipped: {str(exc).splitlines()[0][:90]}", flush=True)
+                back_to_overview(page)
+
+            # Anything the site opened in a tab of its own.
+            for i, other in enumerate(p for p in extra_pages if not p.is_closed()):
+                print(f"  saving extra tab {other.url[:70]}", flush=True)
+                reveal_amounts(other)
+                summary["pages"][f"tab-{i + 1}"] = {**_save(other, f"tab-{i + 1}"),
+                                                    "headings": _headings(other)}
         finally:
             (config.OUTPUT_DIR / "probe-summary.json").write_text(
                 json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
+            for target in (*extra_pages, page):
+                try:
+                    if not target.is_closed():
+                        target.close()
+                except PlaywrightError:
+                    pass
             try:
                 context.close()
                 browser.close()
