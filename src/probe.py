@@ -144,8 +144,9 @@ def open_qr_tab(page) -> bool:
 
 def wait_for_login(page) -> bool:
     """Blocks while you scan the QR. Returns False if the wait runs out."""
-    print(f"\nScan the QR in the window with your iMobile app. Waiting up to "
-          f"{int(config.LOGIN_TIMEOUT / 60)} minutes…", flush=True)
+    budget = (f"{config.LOGIN_TIMEOUT / 60:.0f} minutes" if config.LOGIN_TIMEOUT >= 90
+              else f"{config.LOGIN_TIMEOUT:.0f} seconds")
+    print(f"\nScan the QR in the window with your iMobile app. Waiting up to {budget}…", flush=True)
     print("  (the code expires on its own timer — the page draws a fresh one, "
           "just scan that)", flush=True)
     deadline = time.monotonic() + config.LOGIN_TIMEOUT

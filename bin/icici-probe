@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Runs the ICICI capture from anywhere, in the project's own venv.
+#   icici-probe                 open the browser, wait for the QR scan
+#   ICICI_LOGIN_TIMEOUT=60 icici-probe     give up sooner
+#   ICICI_HEADED=0 icici-probe             no window (no scan possible)
+set -euo pipefail
+
+# Resolve through the ~/Work symlink to the project on the external drive.
+HERE="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+PROJECT="$(dirname "$HERE")"
+
+if [[ ! -x "$PROJECT/.venv/bin/python" ]]; then
+  echo "No venv in $PROJECT — run: uv venv .venv && uv pip install -r requirements.txt --python .venv/bin/python" >&2
+  exit 1
+fi
+
+cd "$PROJECT"
+exec .venv/bin/python -m src.probe "$@"
