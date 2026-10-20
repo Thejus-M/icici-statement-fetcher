@@ -346,6 +346,49 @@ def wait_for_login(page) -> bool:
     return False
 
 
+# What the credit-card page prints, as confirmed across three live runs:
+#   "Coral RuPay -2004 ₹ 0 Min amount due ₹0 … 6528 **** **** 2004 …
+#    Total spent + ₹40 C.R. Total amount due ₹0
+#    Available credit limit ₹1,30,040 … ₹1,30,000 TOTAL CARD LIMIT"
+_CARD_FIELDS = (
+    # Up to three words before "-2004 ₹". The all-caps nav sits right in
+    # front of it ("… CUSTOMER SERVICE Coral RuPay -2004 ₹ 0"), so
+    # uppercase words are dropped and the card's own title-case name kept.
+    ("card", re.compile(r"((?:[A-Za-z]+ ){0,3}[A-Za-z]+)\s*-\s?(\d{4})\s*₹")),
+    ("number", re.compile(r"(\d{4}(?:\s+\*{4}){2}\s+\d{4})")),
+    ("holder", re.compile(r"([A-Z][A-Z ]{4,30})\s+\d{4}(?:\s+\*{4})")),
+    ("minimumDue", re.compile(r"Min(?:imum)? amount due\s*₹\s?([\d,]+(?:\.\d{2})?)", re.I)),
+    ("totalDue", re.compile(r"Total amount due\s*₹\s?([\d,]+(?:\.\d{2})?)", re.I)),
+    ("spentThisCycle", re.compile(r"Total spent\s*([+-])?\s*₹\s?([\d,]+(?:\.\d{2})?)\s*(C\.R\.|D\.R\.)?", re.I)),
+    ("availableLimit", re.compile(r"Available credit limit\s*₹\s?([\d,]+(?:\.\d{2})?)", re.I)),
+    ("totalLimit", re.compile(r"₹\s?([\d,]+(?:\.\d{2})?)\s*TOTAL CARD LIMIT", re.I)),
+)
+_NO_TRANSACTIONS = re.compile(r"no transactions in this billing cycle", re.I)
+
+
+def card_details(text: str) -> dict:
+    """The card's figures, read out of the page's visible text. Only what
+    is actually there — a field the page did not print is left out rather
+    than guessed, so the gap is visible in the printout."""
+    found: dict = {}
+    for name, pattern in _CARD_FIELDS:
+        m = pattern.search(text)
+        if not m:
+            continue
+        if name == "card":
+            words = [w for w in m.group(1).split() if not w.isupper()]
+            found["cardName"], found["last4"] = " ".join(words) or m.group(1), m.group(2)
+        elif name == "spentThisCycle":
+            sign, amount, marker = m.group(1) or "", m.group(2), (m.group(3) or "").upper()
+            # "+ ₹40 C.R." is money the bank owes back, not spend.
+            found["spentThisCycle"] = f"{'-' if marker == 'C.R.' else sign}₹{amount}"
+        else:
+            found[name] = m.group(1) if name in ("number", "holder") else f"₹{m.group(1)}"
+    if _NO_TRANSACTIONS.search(text):
+        found["transactionsThisCycle"] = "none"
+    return found
+
+
 def settle(page, seconds: float = 8.0) -> None:
     """Angular fills these pages well after load; the third run captured
     /bank-account before its content arrived."""
@@ -469,6 +512,7 @@ def run() -> int:
                                           "links": _links(page)}
                 print(f"    now at {page.url[:80]}", flush=True)
                 if "credit-card" in page.url:
+                    summary["card"] = card_details(_text(page))
                     capture_card_statements(page, summary)
 
             # Anything the site opened in a tab of its own.
@@ -493,8 +537,43 @@ def run() -> int:
                 pass
 
     print(f"\nSaved {len(summary['pages'])} pages to {config.OUTPUT_DIR}")
-    print("Read output/probe-summary.json first; the .txt files are the quickest look.")
+    print_findings(summary)
     return 0
+
+
+def print_findings(summary: dict) -> None:
+    """The point of the run, in the terminal: what the card says, where the
+    files are, and what is still missing."""
+    card = summary.get("card") or {}
+    print("\n" + "─" * 58)
+    if card:
+        title = f"{card.get('cardName', 'Credit card')} ••{card.get('last4', '????')}"
+        print(f"  {title}")
+        if card.get("holder"):
+            print(f"  {card['holder'].title()}   {card.get('number', '')}")
+        print()
+        for label, key in (("Total amount due", "totalDue"),
+                           ("Minimum due", "minimumDue"),
+                           ("Spent this cycle", "spentThisCycle"),
+                           ("Available limit", "availableLimit"),
+                           ("Total card limit", "totalLimit"),
+                           ("Transactions this cycle", "transactionsThisCycle")):
+            if key in card:
+                print(f"  {label:<24} {card[key]}")
+    else:
+        print("  No card figures were read — the run did not reach the card page,")
+        print("  or the page's wording has changed. The captures below say which.")
+
+    if summary.get("downloads"):
+        print(f"\n  Statements downloaded: {', '.join(summary['downloads'])}")
+
+    print("\n  Captured pages:")
+    for name, page in summary.get("pages", {}).items():
+        url = (page.get("url") or "").replace("https://retailnetbanking.icici.bank.in", "")
+        print(f"    {name:<34} {url[:46]}")
+    print(f"\n  Files in {config.OUTPUT_DIR}")
+    print("  probe-summary.json has the lot; the .txt files read fastest.")
+    print("─" * 58)
 
 
 if __name__ == "__main__":
