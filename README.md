@@ -5,7 +5,32 @@ transactions database the HDFC, Axis and SBI fetchers write to (the
 `txdb` package inside `omarchy-transactions`), which is what the
 Transactions bar widget reads.
 
-**Status: step one.** Only the probe exists so far. It opens the login
+**Status: the card is live.** `icici-fetch` saves it; `icici-probe`
+remains for capturing markup when something changes.
+
+```bash
+icici-fetch     # scan the QR, and the card lands in the widget's BILLS
+icici-probe     # capture markup instead of saving anything
+```
+
+The fetcher reads the credit card's summary — name, last four, amount
+due, spend this cycle, total and available limit — and writes it as a
+`card_cycles` row, the same shape the HDFC cards use, so the widget shows
+it with no special case. It writes no transactions: this profile has no
+linked bank account and the card reports none this cycle.
+
+Two rules learnt the hard way, both encoded in the code and worth keeping
+if you extend it:
+
+- **Never `page.goto()` an in-app route once logged in.** ICICI ends the
+  session (`/bank-account` bounced to `/login-page`, then everything to
+  `/session-expire`), exactly as HDFC does. Click the sidenav instead.
+- **Never click the card page's eye toggle.** It unmasks the card number
+  and expiry, and ICICI demands an OTP for it — an OTP for data this
+  fetcher neither needs nor should store. Every "mysterious" OTP prompt
+  during development was self-inflicted that way.
+
+**Older note — step one.** Only the probe existed at first. It opens the login
 page, waits while you scan the QR, and saves the real markup of whatever
 comes back. The scraper proper is written from those captures — the same
 way the other three fetchers were — rather than from guesses about a page
