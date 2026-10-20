@@ -23,22 +23,36 @@ from __future__ import annotations
 
 import re
 import sys
+from datetime import datetime
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
 from . import config, store_card
-from .guard import ActionNeeded, FetchError, run_main
+from .guard import ActionNeeded, FetchError, atomic_write_json, run_main
 from .probe import _click, _text, card_details, open_menu, open_qr_tab, settle, wait_for_login
 
 CARD_MENU = "CARDS"
 CARD_ITEM = re.compile(r"credit card", re.I)
 
 
-def write_status(stage: str, message: str = "", **_) -> None:
-    """The widget's progress file is not wired up for ICICI yet; until it
-    is, the run says where it has got to on stdout."""
+STATUS_PATH = config.OUTPUT_DIR / "icici-fetch-status.json"
+
+
+def write_status(stage: str, message: str = "", qr: str = "", card: str = "", step: str = "") -> None:
+    """The progress file the widget's reload button watches, written
+    atomically so it never reads a half-written one. Same keys as the
+    other three banks': the widget needs no ICICI special case.
+
+    `qr` carries the path to the login code, which the widget shows while
+    the stage is qr-ready — the one step that needs you.
+    """
+    config.ensure_output_dir()
+    atomic_write_json(STATUS_PATH, {
+        "stage": stage, "message": message, "qr": qr, "card": card, "step": step,
+        "updated": datetime.now().isoformat(timespec="milliseconds"),
+    }, mode=0o644)
     print(f"  [{stage}] {message}", flush=True)
 
 
@@ -55,7 +69,8 @@ def run() -> str:
             page.wait_for_timeout(4000)
             open_qr_tab(page)
 
-            write_status("qr-ready", "Scan the QR with your iMobile app.")
+            write_status("qr-ready", "Scan the QR with your iMobile app.",
+                         qr=str(config.OUTPUT_DIR / "qr.png"))
             if not wait_for_login(page):
                 raise ActionNeeded("The QR was not scanned in time.")
 
