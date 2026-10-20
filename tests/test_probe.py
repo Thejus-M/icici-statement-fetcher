@@ -56,3 +56,15 @@ def test_a_field_the_page_stops_printing_goes_missing_rather_than_wrong():
 
 def test_nothing_is_invented_from_an_empty_page():
     assert card_details("") == {}
+
+
+def test_otp_is_only_asked_for_when_the_page_asks():
+    """answer_otp must not stop the run on a page that happens to contain a
+    one-character input. The page has to actually mention an OTP."""
+    from src.probe import _OTP_WANTED
+
+    assert _OTP_WANTED.search("Please enter the OTP sent to your mobile")
+    assert _OTP_WANTED.search("Enter One-Time Password")
+    assert _OTP_WANTED.search("verification code")
+    assert not _OTP_WANTED.search(CARD_TEXT)          # the card page does not
+    assert not _OTP_WANTED.search("Adopt a pet")      # not a stray "otp" inside a word

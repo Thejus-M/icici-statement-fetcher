@@ -23,6 +23,7 @@ when you are done sharing anything from it.
 from __future__ import annotations
 
 import json
+import os
 import re
 import sys
 import time
@@ -33,6 +34,7 @@ from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
 from . import config
+from .guard import read_line
 
 # Login is done when the page stops being the login page. Checked against
 # the URL and against the text, because a bank's SPA often keeps the URL
@@ -396,6 +398,66 @@ def card_details(text: str) -> dict:
     return found
 
 
+# ICICI asks for an OTP to go past the card summary (the statement tabs
+# were never "missing" — the page was sitting on an OTP step we never
+# answered, and the session died waiting). The field is sometimes one box
+# and sometimes six single-character ones.
+_OTP_FIELD = ("input[type=tel], input[formcontrolname*=otp i], input[id*=otp i], "
+              "input[name*=otp i], input[aria-label*='otp' i], input[maxlength='1']")
+_OTP_WANTED = re.compile(r"\botp\b|one[- ]time password|verification code", re.I)
+_OTP_SUBMIT = re.compile(r"^(submit|verify|continue|proceed|confirm)$", re.I)
+# Long enough to find the phone, read the message and type it in.
+_OTP_TIMEOUT = float(os.environ.get("ICICI_OTP_TIMEOUT", "180"))
+
+
+def answer_otp(page, where: str = "") -> bool:
+    """If the page is asking for an OTP, ask you for it and type it in.
+
+    Returns True when one was entered. The wait is yours, not the site's:
+    nothing else happens until you type it or the wait runs out, which is
+    the whole point — the previous runs walked on and lost the session.
+    """
+    if page.is_closed():
+        return False
+    fields = page.locator(_OTP_FIELD)
+    try:
+        visible = fields.locator("visible=true")
+        count = visible.count()
+    except PlaywrightError:
+        return False
+    if count == 0 or not _OTP_WANTED.search(_text(page)):
+        return False
+
+    print(f"\n  ICICI is asking for an OTP{' on ' + where if where else ''}.", flush=True)
+    code = read_line("  Type it here and press Enter: ", hidden=False, timeout=_OTP_TIMEOUT)
+    if not code:
+        print("  no OTP typed; carrying on without it.", flush=True)
+        return False
+    digits = re.sub(r"\D", "", code)
+
+    try:
+        if count >= len(digits) > 1:
+            # One box per digit: fill each, since typing into the first
+            # only advances if the site wires it that way.
+            for i, digit in enumerate(digits):
+                visible.nth(i).fill(digit)
+                page.wait_for_timeout(120)
+        else:
+            visible.first.fill(digits)
+        page.wait_for_timeout(500)
+        submit = page.get_by_text(_OTP_SUBMIT)
+        if submit.count():
+            _click(submit, "the OTP submit button")
+        else:
+            page.keyboard.press("Enter")
+        settle(page, 12)
+        print(f"  OTP sent; now at {page.url[:70]}", flush=True)
+        return True
+    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+        print(f"  could not enter the OTP: {str(exc).splitlines()[0][:80]}", flush=True)
+        return False
+
+
 def settle(page, seconds: float = 8.0) -> None:
     """Angular fills these pages well after load; the third run captured
     /bank-account before its content arrived."""
@@ -412,6 +474,7 @@ def capture_card_statements(page, summary: dict) -> None:
     for pattern in _CARD_TABS:
         if page.is_closed():
             return
+        answer_otp(page, "the statements")
         tab = page.get_by_text(pattern)
         if tab.count() == 0:
             print(f"    no {pattern.pattern.strip('^$')} tab on this page", flush=True)
@@ -420,6 +483,7 @@ def capture_card_statements(page, summary: dict) -> None:
         print(f"    tab {pattern.pattern.strip('^$')}", flush=True)
         if _click(tab, name):
             settle(page, 6)
+            answer_otp(page, name)
             reveal_amounts(page)
             summary["pages"][name] = {**_save(page, name), "headings": _headings(page)}
 
@@ -525,6 +589,8 @@ def run() -> int:
                 if page.is_closed():
                     print("    the site closed the page on that click.", flush=True)
                     break
+                if answer_otp(page, name):
+                    summary.setdefault("otpSteps", []).append(name)
                 reveal_amounts(page)
                 summary["pages"][name] = {**_save(page, name), "headings": _headings(page),
                                           "links": _links(page)}
