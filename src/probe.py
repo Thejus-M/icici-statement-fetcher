@@ -48,6 +48,12 @@ _ACCOUNT_LIKE = re.compile(r"(?:[Xx*•]{2,}\s?\d{3,})|(?:\b\d{9,18}\b)")
 _INTERESTING_LINK = re.compile(
     r"statement|transaction|account|balance|detail|history|download|card", re.I)
 
+# The login page opens on the User ID tab; the QR is only drawn once its
+# own tab is selected, into a <canvas>. Confirmed live: the tabs are
+# <button class="tab-btn" data-tts="User ID" | "Mobile No" | "QR code">.
+_QR_TAB = "button.tab-btn[data-tts='QR code']"
+_QR_CANVAS = "canvas"
+
 
 def _slug(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:40] or "page"
@@ -113,10 +119,35 @@ def _links(page) -> list[dict]:
     return out[:60]
 
 
+def open_qr_tab(page) -> bool:
+    """Switches the login form to its QR tab and saves the code as
+    output/qr.png. False when the tab or the code never appeared — the run
+    can still go on, you just log in whichever way the page offers."""
+    tab = page.locator(_QR_TAB)
+    if tab.count() == 0:
+        tab = page.get_by_text("QR Code", exact=True)
+    if tab.count() == 0:
+        print("  no QR tab on this page; log in whichever way it offers.", flush=True)
+        return False
+    try:
+        tab.first.click(timeout=10_000)
+        page.wait_for_selector(_QR_CANVAS, state="visible", timeout=20_000)
+        page.wait_for_timeout(1200)  # let it finish drawing
+        config.ensure_output_dir()
+        page.locator(_QR_CANVAS).first.screenshot(path=str(config.OUTPUT_DIR / "qr.png"))
+        print(f"  QR shown, also saved to {config.OUTPUT_DIR / 'qr.png'}", flush=True)
+        return True
+    except (PlaywrightError, PlaywrightTimeoutError) as exc:
+        print(f"  could not open the QR tab: {str(exc).splitlines()[0][:90]}", flush=True)
+        return False
+
+
 def wait_for_login(page) -> bool:
     """Blocks while you scan the QR. Returns False if the wait runs out."""
     print(f"\nScan the QR in the window with your iMobile app. Waiting up to "
           f"{int(config.LOGIN_TIMEOUT / 60)} minutes…", flush=True)
+    print("  (the code expires on its own timer — the page draws a fresh one, "
+          "just scan that)", flush=True)
     deadline = time.monotonic() + config.LOGIN_TIMEOUT
     last_url = ""
     while time.monotonic() < deadline:
@@ -152,6 +183,8 @@ def run() -> int:
         try:
             print(f"Opening {config.LOGIN_URL}", flush=True)
             page.goto(config.LOGIN_URL, wait_until="domcontentloaded")
+            page.wait_for_timeout(4000)  # Angular draws the form after load
+            summary["qrShown"] = open_qr_tab(page)
             summary["pages"]["login"] = {**_save(page, "login"), "headings": _headings(page)}
 
             if not wait_for_login(page):
