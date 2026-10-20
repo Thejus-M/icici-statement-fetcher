@@ -72,7 +72,7 @@ def _save(page, name: str) -> dict:
     """HTML, a full-page screenshot and the visible text of one page."""
     config.ensure_output_dir()
     base = config.OUTPUT_DIR / name
-    saved = {}
+    saved = {"url": page.url if not page.is_closed() else ""}
     for suffix, produce in ((".html", page.content), ("-dom.html", lambda: _deep_html(page))):
         try:
             (config.OUTPUT_DIR / f"{name}{suffix}").write_text(produce(), encoding="utf-8")
@@ -410,8 +410,11 @@ def capture_card_statements(page, summary: dict) -> None:
     """The statement tabs on the credit-card page, and a statement file if
     the site will give one up."""
     for pattern in _CARD_TABS:
+        if page.is_closed():
+            return
         tab = page.get_by_text(pattern)
-        if tab.count() == 0 or page.is_closed():
+        if tab.count() == 0:
+            print(f"    no {pattern.pattern.strip('^$')} tab on this page", flush=True)
             continue
         name = f"card-tab-{pattern.pattern.strip('^$')}"
         print(f"    tab {pattern.pattern.strip('^$')}", flush=True)
@@ -421,8 +424,11 @@ def capture_card_statements(page, summary: dict) -> None:
             summary["pages"][name] = {**_save(page, name), "headings": _headings(page)}
 
     for pattern in _DOWNLOADS:
+        if page.is_closed():
+            return
         button = page.get_by_text(pattern)
-        if button.count() == 0 or page.is_closed():
+        if button.count() == 0:
+            print(f"    no {pattern.pattern.strip('^$')} download button on this page", flush=True)
             continue
         label = pattern.pattern.strip("^$")
         try:
@@ -448,7 +454,12 @@ def run() -> int:
         # may well open in one — but never let one replace the main page.
         context.on("page", lambda p: extra_pages.append(p))
         page.on("dialog", lambda d: d.dismiss())
-        page.on("close", lambda: print("  !! the site closed the main page", flush=True))
+        # Only a surprise close is worth reporting; the one in the cleanup
+        # below is ours, and saying so there read like a failure after a
+        # run that had in fact finished.
+        closing_up = {"done": False}
+        page.on("close", lambda: None if closing_up["done"]
+                else print("  !! the site closed the main page", flush=True))
         page.set_default_timeout(30_000)
 
         try:
@@ -538,6 +549,7 @@ def run() -> int:
             if summary.get("pages"):
                 print(f"\nSaved {len(summary['pages'])} pages to {config.OUTPUT_DIR}")
                 print_findings(summary)
+            closing_up["done"] = True
             for target in (*extra_pages, page):
                 try:
                     if not target.is_closed():
