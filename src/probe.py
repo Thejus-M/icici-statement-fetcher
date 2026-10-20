@@ -200,8 +200,11 @@ _ROUTES = [
 # On the credit-card page: the statement tabs, and the downloads beside
 # them. A statement file is a better transaction source than scraping a
 # table, if the site will hand one over.
-_CARD_TABS = [re.compile(r"^current$", re.I), re.compile(r"^past$", re.I), re.compile(r"^status$", re.I)]
-_DOWNLOADS = [re.compile(r"^xls$", re.I), re.compile(r"^pdf$", re.I)]
+# Whitespace around the label is not normalised for a regex match, and
+# "CURRENT" sits in the markup with plenty of it.
+_CARD_TABS = [re.compile(r"^\s*current\s*$", re.I), re.compile(r"^\s*past\s*$", re.I),
+              re.compile(r"^\s*status\s*$", re.I)]
+_DOWNLOADS = [re.compile(r"^\s*xls\s*$", re.I), re.compile(r"^\s*pdf\s*$", re.I)]
 _QUICK_LINKS = [re.compile(r"^view statement$", re.I)]
 
 # A small, readable serialisation of the DOM: tags, attributes and text,
@@ -229,8 +232,16 @@ def _deep_html(page) -> str:
 
 
 def reveal_amounts(page) -> int:
-    """Clicks every mask toggle, so a capture holds figures rather than
-    "Rs •••". Returns how many it clicked."""
+    """Clicks the overview's mask toggle, so a capture holds figures rather
+    than "Rs •••". Returns how many it clicked.
+
+    Never on the card page: the eye there unmasks the card number and
+    expiry, which is what was triggering ICICI's OTP on every run — an OTP
+    for data we do not want and do not store. The card page shows its
+    amounts unmasked anyway.
+    """
+    if "credit-card" in page.url or "card" in page.url:
+        return 0
     clicked = 0
     try:
         toggles = page.locator(_REVEAL)
@@ -507,7 +518,6 @@ def capture_card_statements(page, summary: dict) -> None:
     for pattern in _CARD_TABS:
         if page.is_closed():
             return
-        answer_otp(page, "the statements")
         tab = page.get_by_text(pattern)
         if tab.count() == 0:
             print(f"    no {pattern.pattern.strip('^$')} tab on this page", flush=True)
@@ -648,6 +658,9 @@ def run() -> int:
             if summary.get("pages"):
                 print(f"\nSaved {len(summary['pages'])} pages to {config.OUTPUT_DIR}")
                 print_findings(summary)
+            if os.environ.get("ICICI_KEEP_OPEN") == "1" and not page.is_closed():
+                read_line("\n  Done. Press Enter to close the browser: ", hidden=False, timeout=600)
+            print("  closing the browser.", flush=True)
             closing_up["done"] = True
             for target in (*extra_pages, page):
                 try:
