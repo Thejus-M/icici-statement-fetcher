@@ -405,7 +405,9 @@ def card_details(text: str) -> dict:
 _OTP_FIELD = ("input[type=tel], input[formcontrolname*=otp i], input[id*=otp i], "
               "input[name*=otp i], input[aria-label*='otp' i], input[maxlength='1']")
 _OTP_WANTED = re.compile(r"\botp\b|one[- ]time password|verification code", re.I)
-_OTP_SUBMIT = re.compile(r"^(submit|verify|continue|proceed|confirm)$", re.I)
+# Not anchored: the live button's wording is unknown, and an anchored
+# match found nothing last run. Checked against the dialog's own buttons.
+_OTP_SUBMIT = re.compile(r"submit|verify|validate|confirm|continue|proceed|done", re.I)
 # Long enough to find the phone, read the message and type it in.
 _OTP_TIMEOUT = float(os.environ.get("ICICI_OTP_TIMEOUT", "180"))
 
@@ -429,6 +431,21 @@ def answer_otp(page, where: str = "") -> bool:
         return False
 
     print(f"\n  ICICI is asking for an OTP{' on ' + where if where else ''}.", flush=True)
+    # Flying blind on this dialog so far, so keep it: the field shapes and
+    # the button wording are what the next version needs.
+    _save(page, f"otp-{_slug(where) or 'prompt'}")
+    try:
+        shapes = visible.evaluate_all(
+            """els => els.slice(0, 8).map(e => ({tag: e.tagName.toLowerCase(), type: e.type || '',
+                 id: e.id || '', name: e.name || '', maxlength: e.getAttribute('maxlength') || '',
+                 label: e.getAttribute('aria-label') || e.getAttribute('placeholder') || ''}))""")
+        print(f"  fields: {shapes}", flush=True)
+        buttons = page.locator("button, [role=button], input[type=submit]").locator(
+            "visible=true").evaluate_all(
+            """els => els.slice(0, 12).map(e => (e.innerText || e.value || '').trim()).filter(Boolean)""")
+        print(f"  buttons on screen: {buttons}", flush=True)
+    except PlaywrightError:
+        buttons = []
     code = read_line("  Type it here and press Enter: ", hidden=False, timeout=_OTP_TIMEOUT)
     if not code:
         print("  no OTP typed; carrying on without it.", flush=True)
@@ -445,13 +462,29 @@ def answer_otp(page, where: str = "") -> bool:
         else:
             visible.first.fill(digits)
         page.wait_for_timeout(500)
-        submit = page.get_by_text(_OTP_SUBMIT)
-        if submit.count():
-            _click(submit, "the OTP submit button")
-        else:
-            page.keyboard.press("Enter")
+
+        # Enter on the field itself first: after filling the last box the
+        # focus is there, and a dialog that submits on Enter needs nothing
+        # else. Then the dialog's own buttons, by wording.
+        pressed = "Enter on the field"
+        try:
+            visible.nth(min(count, len(digits)) - 1).press("Enter")
+        except (PlaywrightError, PlaywrightTimeoutError):
+            pressed = ""
+        page.wait_for_timeout(1500)
+
+        if _OTP_WANTED.search(_text(page)):  # still asking
+            submit = page.locator("button, [role=button], input[type=submit]").locator(
+                "visible=true").filter(has_text=_OTP_SUBMIT)
+            if submit.count() and _click(submit, "the OTP submit button"):
+                pressed = "a submit button"
+            else:
+                print(f"  nothing to submit with. Buttons seen: {buttons}", flush=True)
+                pressed = pressed or "nothing"
         settle(page, 12)
-        print(f"  OTP sent; now at {page.url[:70]}", flush=True)
+        _save(page, f"otp-{_slug(where) or 'prompt'}-after")
+        still = "still asking" if _OTP_WANTED.search(_text(page)) else "accepted"
+        print(f"  submitted with {pressed}: {still}; now at {page.url[:60]}", flush=True)
         return True
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
         print(f"  could not enter the OTP: {str(exc).splitlines()[0][:80]}", flush=True)
