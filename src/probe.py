@@ -174,12 +174,24 @@ def open_qr_tab(page) -> bool:
 
 _REVEAL = "[class*=eye i], [aria-label*='show' i], [aria-label*='unmask' i]"
 
-# Each top-nav menu, and the item inside it worth opening.
+# Where the money is. The third live run proved these are real routes —
+# clicking the sidenav item changed the URL — so the probe goes straight
+# there and only falls back to opening the menu when a route 404s or
+# bounces. Navigating by URL also sidesteps the sidenav's hidden twin and
+# the menu that goes stale after a route change (the third run's DEPOSITS
+# menu still listed the CARDS items).
 _ROUTES = [
-    ("ACCOUNTS", re.compile(r"bank account|account detail|saving", re.I)),
-    ("CARDS", re.compile(r"credit card|debit card|card detail", re.I)),
-    ("DEPOSITS", re.compile(r"fixed deposit|recurring", re.I)),
+    ("/bank-account", "ACCOUNTS", re.compile(r"bank account|account detail|saving", re.I)),
+    ("/credit-card", "CARDS", re.compile(r"credit card|card detail", re.I)),
+    ("/deposit", "DEPOSITS", re.compile(r"fixed deposit|recurring", re.I)),
 ]
+_BASE_URL = "https://retailnetbanking.icici.bank.in"
+
+# On the credit-card page: the statement tabs, and the downloads beside
+# them. A statement file is a better transaction source than scraping a
+# table, if the site will hand one over.
+_CARD_TABS = [re.compile(r"^current$", re.I), re.compile(r"^past$", re.I), re.compile(r"^status$", re.I)]
+_DOWNLOADS = [re.compile(r"^xls$", re.I), re.compile(r"^pdf$", re.I)]
 _QUICK_LINKS = [re.compile(r"^view statement$", re.I)]
 
 # A small, readable serialisation of the DOM: tags, attributes and text,
@@ -333,6 +345,46 @@ def wait_for_login(page) -> bool:
     return False
 
 
+def settle(page, seconds: float = 8.0) -> None:
+    """Angular fills these pages well after load; the third run captured
+    /bank-account before its content arrived."""
+    try:
+        page.wait_for_load_state("networkidle", timeout=seconds * 1000)
+    except (PlaywrightError, PlaywrightTimeoutError):
+        pass
+    page.wait_for_timeout(2500)
+
+
+def capture_card_statements(page, summary: dict) -> None:
+    """The statement tabs on the credit-card page, and a statement file if
+    the site will give one up."""
+    for pattern in _CARD_TABS:
+        tab = page.get_by_text(pattern)
+        if tab.count() == 0 or page.is_closed():
+            continue
+        name = f"card-tab-{pattern.pattern.strip('^$')}"
+        print(f"    tab {pattern.pattern.strip('^$')}", flush=True)
+        if _click(tab, name):
+            settle(page, 6)
+            reveal_amounts(page)
+            summary["pages"][name] = {**_save(page, name), "headings": _headings(page)}
+
+    for pattern in _DOWNLOADS:
+        button = page.get_by_text(pattern)
+        if button.count() == 0 or page.is_closed():
+            continue
+        label = pattern.pattern.strip("^$")
+        try:
+            with page.expect_download(timeout=20_000) as download:
+                _click(button, label)
+            saved = config.OUTPUT_DIR / f"statement.{label.lower()}"
+            download.value.save_as(str(saved))
+            summary.setdefault("downloads", []).append(saved.name)
+            print(f"    downloaded {saved.name}", flush=True)
+        except (PlaywrightError, PlaywrightTimeoutError):
+            print(f"    no {label} download (it may need a date range first)", flush=True)
+
+
 def run() -> int:
     config.ensure_output_dir()
     summary: dict = {"loginUrl": config.LOGIN_URL, "pages": {}, "menus": {}}
@@ -388,18 +440,38 @@ def run() -> int:
                     print(f"    now at {page.url[:80]}", flush=True)
                 back_to_overview(page)
 
-            # Then each nav menu, and the item in it worth opening.
-            for label, wanted in _ROUTES:
+            # Then each section, by URL first.
+            for route, label, wanted in _ROUTES:
                 if page.is_closed():
                     print("  stopping: the session is gone.", flush=True)
                     break
+                name = f"page-{_slug(route)}"
+                print(f"  {route}", flush=True)
+                reached = False
+                try:
+                    page.goto(_BASE_URL + route, wait_until="domcontentloaded")
+                    settle(page)
+                    reached = route.strip("/") in page.url and not _LOGGED_OUT_URL.search(page.url)
+                    if not reached:
+                        print(f"    the route bounced to {page.url[:70]}", flush=True)
+                except (PlaywrightError, PlaywrightTimeoutError) as exc:
+                    print(f"    goto failed: {str(exc).splitlines()[0][:70]}", flush=True)
+
+                if reached:
+                    reveal_amounts(page)
+                    summary["pages"][name] = {**_save(page, name), "headings": _headings(page),
+                                              "links": _links(page)}
+                    if "credit-card" in route:
+                        capture_card_statements(page, summary)
+                    continue
+
+                # Fallback: the sidenav, the way the third run got there.
                 items = open_menu(page, label)
                 summary["menus"][label] = items
-                print(f"  {label}: {', '.join(items[:6]) or '(no items found)'}", flush=True)
+                print(f"    {label} menu: {', '.join(items[:6]) or '(no items found)'}", flush=True)
                 target = next((i for i in items if wanted.search(i)), None)
                 if not target:
                     continue
-                name = f"menu-{_slug(label)}-{_slug(target)}"
                 print(f"    opening {target!r}", flush=True)
                 # The open submenu's markup is worth keeping whether or not
                 # the click lands: it is where the real selectors live.
