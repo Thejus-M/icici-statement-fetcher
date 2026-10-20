@@ -174,18 +174,19 @@ def open_qr_tab(page) -> bool:
 
 _REVEAL = "[class*=eye i], [aria-label*='show' i], [aria-label*='unmask' i]"
 
-# Where the money is. The third live run proved these are real routes —
-# clicking the sidenav item changed the URL — so the probe goes straight
-# there and only falls back to opening the menu when a route 404s or
-# bounces. Navigating by URL also sidesteps the sidenav's hidden twin and
-# the menu that goes stale after a route change (the third run's DEPOSITS
-# menu still listed the CARDS items).
+# NEVER page.goto() an in-app route once logged in. The fourth live run
+# did exactly that and lost the session on the first one: /bank-account
+# bounced to /login-page and everything after it to /session-expire. ICICI
+# behaves like HDFC — only real in-app clicks are allowed, so the sidenav
+# is the way in, hidden twin and all.
+#
+# This profile holds one credit card and no linked bank account (that run's
+# /bank-account page offered "LINK SAVINGS ACCOUNT", and the overview reads
+# "WHAT I HAVE Rs 0.00"), so the probe spends its one surviving session on
+# the card.
 _ROUTES = [
-    ("/bank-account", "ACCOUNTS", re.compile(r"bank account|account detail|saving", re.I)),
-    ("/credit-card", "CARDS", re.compile(r"credit card|card detail", re.I)),
-    ("/deposit", "DEPOSITS", re.compile(r"fixed deposit|recurring", re.I)),
+    ("CARDS", re.compile(r"credit card|card detail", re.I)),
 ]
-_BASE_URL = "https://retailnetbanking.icici.bank.in"
 
 # On the credit-card page: the statement tabs, and the downloads beside
 # them. A statement file is a better transaction source than scraping a
@@ -440,52 +441,35 @@ def run() -> int:
                     print(f"    now at {page.url[:80]}", flush=True)
                 back_to_overview(page)
 
-            # Then each section, by URL first.
-            for route, label, wanted in _ROUTES:
+            # Then the card, through the sidenav — the only navigation
+            # this site tolerates.
+            for label, wanted in _ROUTES:
                 if page.is_closed():
                     print("  stopping: the session is gone.", flush=True)
                     break
-                name = f"page-{_slug(route)}"
-                print(f"  {route}", flush=True)
-                reached = False
-                try:
-                    page.goto(_BASE_URL + route, wait_until="domcontentloaded")
-                    settle(page)
-                    reached = route.strip("/") in page.url and not _LOGGED_OUT_URL.search(page.url)
-                    if not reached:
-                        print(f"    the route bounced to {page.url[:70]}", flush=True)
-                except (PlaywrightError, PlaywrightTimeoutError) as exc:
-                    print(f"    goto failed: {str(exc).splitlines()[0][:70]}", flush=True)
-
-                if reached:
-                    reveal_amounts(page)
-                    summary["pages"][name] = {**_save(page, name), "headings": _headings(page),
-                                              "links": _links(page)}
-                    if "credit-card" in route:
-                        capture_card_statements(page, summary)
-                    continue
-
-                # Fallback: the sidenav, the way the third run got there.
                 items = open_menu(page, label)
                 summary["menus"][label] = items
-                print(f"    {label} menu: {', '.join(items[:6]) or '(no items found)'}", flush=True)
+                print(f"  {label}: {', '.join(items[:6]) or '(no items found)'}", flush=True)
                 target = next((i for i in items if wanted.search(i)), None)
                 if not target:
                     continue
+                name = f"menu-{_slug(label)}-{_slug(target)}"
                 print(f"    opening {target!r}", flush=True)
                 # The open submenu's markup is worth keeping whether or not
                 # the click lands: it is where the real selectors live.
                 _save(page, f"{name}-menu-open")
-                if _click(page.get_by_text(re.compile(rf"^{re.escape(target)}$", re.I)), target):
-                    page.wait_for_timeout(4500)
-                    if page.is_closed():
-                        print("    the site closed the page on that click.", flush=True)
-                        break
-                    reveal_amounts(page)
-                    summary["pages"][name] = {**_save(page, name), "headings": _headings(page),
-                                              "links": _links(page)}
-                    print(f"    now at {page.url[:80]}", flush=True)
-                back_to_overview(page)
+                if not _click(page.get_by_text(re.compile(rf"^{re.escape(target)}$", re.I)), target):
+                    continue
+                settle(page)
+                if page.is_closed():
+                    print("    the site closed the page on that click.", flush=True)
+                    break
+                reveal_amounts(page)
+                summary["pages"][name] = {**_save(page, name), "headings": _headings(page),
+                                          "links": _links(page)}
+                print(f"    now at {page.url[:80]}", flush=True)
+                if "credit-card" in page.url:
+                    capture_card_statements(page, summary)
 
             # Anything the site opened in a tab of its own.
             for i, other in enumerate(p for p in extra_pages if not p.is_closed()):
