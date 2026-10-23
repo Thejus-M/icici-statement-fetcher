@@ -10,6 +10,9 @@ what the site actually serves rather than against an assumption.
 
 What it leaves in output/:
 
+  qr.png                            the login code, redrawn for the
+                                    widget and deleted again once the
+                                    run ends
   landing.html / landing.png        the page right after login
   landing.txt                       its visible text, for reading quickly
   <slug>.html / <slug>.png          the same for each page it then opens
@@ -27,13 +30,15 @@ import os
 import re
 import sys
 import time
+from collections.abc import Callable
+from pathlib import Path
 
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
 from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
-from . import config
+from . import config, qr
 from .guard import read_line
 
 # Login is done when the page stops being the login page. Checked against
@@ -55,6 +60,21 @@ _INTERESTING_LINK = re.compile(
 # <button class="tab-btn" data-tts="User ID" | "Mobile No" | "QR code">.
 _QR_TAB = "button.tab-btn[data-tts='QR code']"
 _QR_CANVAS = "canvas"
+# How often the canvas is re-screenshotted while waiting for the scan.
+# ICICI replaces the code every 30 seconds, so this is about noticing a
+# redraw quickly, not about keeping up with one.
+_QR_POLL_S = 2.0
+# After about four codes (90-120 seconds, measured) ICICI removes the
+# canvas altogether: no refresh button, no "expired" message, just the QR
+# tab sitting empty. Clicking the tab again sometimes starts a fresh run of
+# codes — it did once out of four live runs, and the others found no canvas
+# at all 8 seconds after the click — so the wait tries this many times and
+# then tells the widget the code is dead rather than leaving a retired one
+# in the popup.
+_QR_REVIVALS = 3
+# How many seconds to keep screenshotting after a revival click before
+# giving up on it: the component redraws asynchronously.
+_QR_REVIVAL_TRIES = 8
 
 
 def _slug(text: str) -> str:
@@ -129,10 +149,52 @@ def _links(page) -> list[dict]:
     return out[:60]
 
 
+def capture_qr(page) -> bytes:
+    """The QR canvas as PNG bytes, or b"" once it has gone (login done, the
+    page navigating, the canvas detached). Never raises: the wait loop asks
+    for this every couple of seconds and a missed screenshot is not a
+    failed login."""
+    try:
+        canvas = page.locator(_QR_CANVAS).first
+        if not canvas.count():
+            return b""
+        return canvas.screenshot(timeout=5000)
+    except (PlaywrightError, PlaywrightTimeoutError):
+        return b""
+
+
+def _ask_for_a_new_code(page) -> bytes:
+    """Re-selects the QR tab, which makes ICICI draw codes again after it
+    has given up, and returns the new canvas (b"" if nothing came back).
+
+    The canvas is screenshotted again each second rather than waited for
+    with wait_for_selector: on a live page the visibility wait timed out
+    while a plain screenshot a second or two after the click returned the
+    new code."""
+    try:
+        tab = page.locator(_QR_TAB)
+        if not tab.count():
+            return b""
+        _click(tab, "the QR tab")
+        for attempt in range(_QR_REVIVAL_TRIES):
+            page.wait_for_timeout(1000)
+            shot = capture_qr(page)
+            if shot:
+                return shot
+            if attempt == _QR_REVIVAL_TRIES - 1:
+                print(f"      (nothing drawn {_QR_REVIVAL_TRIES}s after the click; "
+                      f"{page.locator(_QR_CANVAS).count()} canvas element(s) on the page)",
+                      flush=True)
+    except (PlaywrightError, PlaywrightTimeoutError):
+        pass
+    return b""
+
+
 def open_qr_tab(page) -> bool:
-    """Switches the login form to its QR tab and saves the code as
-    output/qr.png. False when the tab or the code never appeared — the run
-    can still go on, you just log in whichever way the page offers."""
+    """Switches the login form to its QR tab and publishes the code for the
+    widget as output/qr.png (see qr.publish). False when the tab or the code
+    never appeared — the run can still go on, you just log in whichever way
+    the page offers."""
     tab = page.locator(_QR_TAB)
     if tab.count() == 0:
         tab = page.get_by_text("QR Code", exact=True)
@@ -143,9 +205,10 @@ def open_qr_tab(page) -> bool:
         tab.first.click(timeout=10_000)
         page.wait_for_selector(_QR_CANVAS, state="visible", timeout=20_000)
         page.wait_for_timeout(1200)  # let it finish drawing
-        config.ensure_output_dir()
-        page.locator(_QR_CANVAS).first.screenshot(path=str(config.OUTPUT_DIR / "qr.png"))
-        print(f"  QR shown, also saved to {config.OUTPUT_DIR / 'qr.png'}", flush=True)
+        if qr.publish(capture_qr(page)) is None:
+            print("  the QR tab opened but its canvas screenshotted blank.", flush=True)
+            return False
+        print(f"  QR shown, and published for the widget as {qr.QR_PATH}", flush=True)
         return True
     except (PlaywrightError, PlaywrightTimeoutError) as exc:
         print(f"  could not open the QR tab: {str(exc).splitlines()[0][:90]}", flush=True)
@@ -340,16 +403,42 @@ def back_to_overview(page) -> bool:
     return False
 
 
-def wait_for_login(page) -> bool:
-    """Blocks while you scan the QR. Returns False if the wait runs out."""
+def wait_for_login(page, on_qr: Callable[[Path], None] | None = None,
+                   on_expired: Callable[[], None] | None = None) -> bool:
+    """Blocks while you scan the QR. Returns False if the wait runs out.
+
+    ICICI expires the code on its own timer and redraws the canvas, so the
+    canvas is re-screenshotted every few seconds and republished whenever
+    the code has actually changed (qr.publish does that comparison). `on_qr`
+    is called with the path each time it does, which is how the widget's
+    status file gets a new `updated` stamp and reloads the image — without
+    it the popup would keep showing a code the bank has already retired.
+
+    ICICI also stops drawing codes after a minute or two and leaves the
+    tab empty, so an empty canvas twice over asks for a new code (see
+    _QR_REVIVALS). When that stops working too, qr.png is removed and
+    `on_expired` is called once: better an empty popup saying the code is
+    gone than a code the phone will refuse.
+
+    qr.png is removed the moment login succeeds; a caller that gives up
+    has to call qr.forget() itself.
+    """
     budget = (f"{config.LOGIN_TIMEOUT / 60:.0f} minutes" if config.LOGIN_TIMEOUT >= 90
               else f"{config.LOGIN_TIMEOUT:.0f} seconds")
-    print(f"\nScan the QR in the window with your iMobile app. Waiting up to {budget}…", flush=True)
+    print(f"\nScan the QR with your iMobile app. Waiting up to {budget}…", flush=True)
     print("  (the code expires on its own timer — the page draws a fresh one, "
-          "just scan that)", flush=True)
+          "which is republished for the widget as it appears)", flush=True)
     deadline = time.monotonic() + config.LOGIN_TIMEOUT
+    next_qr_check = time.monotonic() + _QR_POLL_S
     last_url = ""
+    empty_polls = revivals = 0
+    expired = False
     while time.monotonic() < deadline:
+        # The canvas is only screenshotted while this is still the login
+        # page. _QR_CANVAS matches any <canvas>, and the dashboard behind
+        # the login has charts: a check that threw mid-navigation would
+        # otherwise publish a slice of a chart as the login code.
+        on_login_page = False
         try:
             url = page.url
             if url != last_url:
@@ -358,10 +447,38 @@ def wait_for_login(page) -> bool:
             body = page.locator("body").inner_text()
             if not _LOGGED_OUT_URL.search(url) or _LOGGED_IN_TEXT.search(body):
                 print("  looks logged in.", flush=True)
+                qr.forget()
                 page.wait_for_timeout(2500)  # let the dashboard settle
                 return True
+            on_login_page = True
         except PlaywrightError:
             pass  # mid-navigation; try again
+        if on_login_page and time.monotonic() >= next_qr_check:
+            next_qr_check = time.monotonic() + _QR_POLL_S
+            shot = capture_qr(page)
+            # Two empty polls in a row, so a canvas caught between redraws
+            # does not spend a revival.
+            empty_polls = 0 if shot else empty_polls + 1
+            if empty_polls >= 2 and revivals < _QR_REVIVALS:
+                revivals += 1
+                empty_polls = 0
+                print(f"  the QR tab went empty; asking for a new code "
+                      f"({revivals} of {_QR_REVIVALS}).", flush=True)
+                shot = _ask_for_a_new_code(page)
+                if not shot:
+                    print("    no code came back.", flush=True)
+            if not shot and revivals >= _QR_REVIVALS and not expired:
+                expired = True
+                qr.forget()
+                print("  the code is gone and ICICI is not drawing another; "
+                      "clearing it rather than showing a dead one.", flush=True)
+                if on_expired is not None:
+                    on_expired()
+            fresh = qr.publish(shot)
+            if fresh is not None:
+                print("  the page drew a fresh code; republished it.", flush=True)
+                if on_qr is not None:
+                    on_qr(fresh)
         time.sleep(1.0)
     return False
 
@@ -465,6 +582,7 @@ def capture_card_statements(page, summary: dict) -> None:
 
 def run() -> int:
     config.ensure_output_dir()
+    qr.forget()  # a code left by a killed run is not this run's
     summary: dict = {"loginUrl": config.LOGIN_URL, "pages": {}, "menus": {}}
     extra_pages: list = []
 
@@ -563,6 +681,7 @@ def run() -> int:
                 summary["pages"][f"tab-{i + 1}"] = {**_save(other, f"tab-{i + 1}"),
                                                     "headings": _headings(other)}
         finally:
+            qr.forget()
             (config.OUTPUT_DIR / "probe-summary.json").write_text(
                 json.dumps(summary, indent=2, ensure_ascii=False), encoding="utf-8")
             # Printed here, not at the end of run(): the site closing the

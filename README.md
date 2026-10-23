@@ -53,16 +53,18 @@ cd ~/Work/icici-statement-fetcher
 .venv/bin/python -m src.probe
 ```
 
-A Chromium window opens on the login page — it has to be visible, since
-you scan the QR off the screen with the iMobile app. The probe waits up to
-five minutes (`ICICI_LOGIN_TIMEOUT`), notices when the page stops being the
-login page, then saves:
+A Chromium window opens on the login page, so there is always a code on
+screen to scan with the iMobile app (the widget's popup shows the same
+code — see Login). The probe waits up to five minutes
+(`ICICI_LOGIN_TIMEOUT`), notices when the page stops being the login page,
+then saves:
 
 | file | what it is |
 |---|---|
 | `output/landing.html` / `.png` / `.txt` | the page right after login, as markup, picture and plain text |
 | `output/page-<name>.*` | the same for up to six pages it then opens (statements, transactions, account detail) |
 | `output/probe-summary.json` | headings, every amount and account-looking number it saw, and each link it found with a selector that reaches it |
+| `output/qr.png` | the login code, redrawn for the widget and deleted when the run ends |
 
 Those files contain your account data. `output/` is git-ignored; delete it
 once the selectors are written.
@@ -70,12 +72,44 @@ once the selectors are written.
 ## Login
 
 QR only. You scan, the browser session is the session — nothing is stored,
-no password is handled, and there is no `.env` to fill in. `ICICI_HEADED=0`
-exists for later, when a run no longer needs a scan.
+no password is handled, and there is no `.env` to fill in.
+
+The code does not have to be scanned off the browser window. ICICI draws
+it into a `<canvas>`, which `src/qr.py` screenshots, decodes with
+`zbarimg` and redraws on the widget's dark tile as `output/qr.png` — the
+same hand-off the HDFC fetcher makes, so the Transactions widget shows the
+code in its own popup. ICICI replaces the code about every 30 seconds; each
+new one is republished and the status file re-written, which is what makes
+the popup reload the image.
+
+After about four codes (90-120 seconds) ICICI stops: it removes the canvas
+and leaves the QR tab empty, with no refresh button and no message.
+Re-clicking that tab brought a fresh code back in one live run out of four
+— in the others no canvas existed at all eight seconds later — so the wait
+tries it three times and then clears `output/qr.png` and says "The login
+code expired. Fetch again." in the widget. A popup with no code beats a
+popup with a code the phone refuses. Scanning inside the first two minutes
+avoids the whole question.
+
+`output/qr.png` is a login credential: it is written through a temp file
+(never half-drawn) and deleted as soon as login succeeds, the run fails or
+Cancel stops it.
+
+The finder rings use ICICI's own two theme colours by default — red outer
+ring, orange inner dot, sampled from ICICI's real header logo and the same
+pair `IciciLogo.qml`'s mark fades between — rather than one flat accent.
+`QR_FG`, `QR_BG`, `QR_ACCENT` and `QR_ACCENT2` (`#rrggbb` only) override
+the colours. Swapping the first two renders the usual dark-on-light code,
+if a phone ever refuses the light-on-dark one. `ICICI_HEADED=0` hides the
+browser window; the window still shows by default, so there is always
+something to scan if the popup's code does not read.
 
 ## Files
 
 - `src/probe.py` — the capture run described above
+- `src/qr.py` — the login code for the widget: decode, redraw, publish,
+  and delete again. Needs `zbarimg`, `qrencode` and Pillow; without any of
+  them it publishes ICICI's own screenshot, which still scans
 - `src/browser.py` — Chromium, headed by default, desktop user-agent
 - `src/config.py` — login URL, output directory, timeouts
 - `src/guard.py`, `src/store.py` — byte-identical copies of the other

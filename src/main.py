@@ -29,12 +29,15 @@ from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import sync_playwright
 
 from . import browser as browser_mod
-from . import config, store_card
+from . import config, qr, store_card
 from .guard import ActionNeeded, FetchError, atomic_write_json, run_main
 from .probe import _click, _text, card_details, open_menu, open_qr_tab, settle, wait_for_login
 
 CARD_MENU = "CARDS"
 CARD_ITEM = re.compile(r"credit card", re.I)
+# One wording for the one step that needs you, reused every time the code
+# is republished so the popup's line does not change under you.
+QR_MESSAGE = "Scan the QR with your iMobile app."
 
 
 STATUS_PATH = config.OUTPUT_DIR / "icici-fetch-status.json"
@@ -46,7 +49,12 @@ def write_status(stage: str, message: str = "", qr: str = "", card: str = "", st
     other three banks': the widget needs no ICICI special case.
 
     `qr` carries the path to the login code, which the widget shows while
-    the stage is qr-ready — the one step that needs you.
+    the stage is qr-ready — the one step that needs you. (It is one of the
+    four banks' shared keys, so it keeps that name and shadows the `qr`
+    module inside this function; the module is only used outside it.)
+    ICICI retires the code on a timer, so this is written again for each
+    redrawn one: the widget keys its image cache on `updated`, and would
+    otherwise keep showing the first code it was given.
     """
     config.ensure_output_dir()
     atomic_write_json(STATUS_PATH, {
@@ -64,14 +72,28 @@ def run() -> str:
         page.set_default_timeout(30_000)
 
         try:
+            # A code left behind by a run that was killed outright is not
+            # this run's code: clear it before the status can say qr-ready
+            # and point the widget at it.
+            qr.forget()
             write_status("opening", "Opening ICICI…")
             page.goto(config.LOGIN_URL, wait_until="domcontentloaded")
             page.wait_for_timeout(4000)
-            open_qr_tab(page)
-
-            write_status("qr-ready", "Scan the QR with your iMobile app.",
-                         qr=str(config.OUTPUT_DIR / "qr.png"))
-            if not wait_for_login(page):
+            # Only point the widget at a code that is actually there: with
+            # no qr path the popup stays shut and the message line carries
+            # the fallback, rather than the popup showing a broken image.
+            if open_qr_tab(page):
+                write_status("qr-ready", QR_MESSAGE, qr=str(qr.QR_PATH))
+            else:
+                write_status("qr-ready", "Scan the QR in the browser window.")
+            if not wait_for_login(
+                    page,
+                    on_qr=lambda path: write_status("qr-ready", QR_MESSAGE, qr=str(path)),
+                    # No qr path, so the popup closes and this line shows
+                    # instead: the code ICICI retired cannot be scanned, and
+                    # saying so beats leaving it on screen.
+                    on_expired=lambda: write_status(
+                        "qr-ready", "The login code expired. Fetch again.")):
                 raise ActionNeeded("The QR was not scanned in time.")
 
             write_status("reading-card", "Reading the credit card…")
@@ -93,6 +115,9 @@ def run() -> str:
             return (f"ICICI: {card.get('cardName', 'card')} ••{card['last4']} — "
                     f"{due} due, limit {limit} ({account_id}).")
         finally:
+            # The login code is a credential: it goes whether the run
+            # succeeded, failed or was cancelled.
+            qr.forget()
             for closer in (context.close, browser.close):
                 try:
                     closer()
