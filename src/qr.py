@@ -51,6 +51,7 @@ _ACCENT2 = (239, 127, 26)   # orange, inner dot
 _OUTPUT_PX = 680        # approximate final side of qr.png
 _SUPERSAMPLE = 4        # draw at 4x, then downsample with a box filter (no overshoot)
 _QUIET_MODULES = 3      # margin around the code, in modules
+_ICON_FRACTION = 0.19   # centre plate side as a fraction of the code side, same as HDFC's
 _HEX = re.compile(r"^#[0-9a-fA-F]{6}$")
 
 # Fingerprint of the code currently in qr.png: the payload when it decoded,
@@ -103,9 +104,11 @@ def qr_matrix(payload: str) -> list[list[bool]]:
 
 def render(payload: str, out_path: Path) -> None:
     """Writes the widget's QR PNG for `payload` to `out_path`: rounded light
-    modules on the dark tile, with the three finder rings in ICICI's own
-    red-and-orange, not one flat accent. Nothing is drawn in the middle —
-    no logo plate — so every module of the code stays on the tile."""
+    modules on the dark tile, the three finder rings in ICICI's own
+    red-and-orange, and a small ICICI mark on a dark plate in the centre —
+    the same layout the HDFC fetcher's own `_render_qr` uses. Safe at
+    `_ICON_FRACTION`: the code is encoded at error-correction level H
+    (`qr_matrix`), which tolerates roughly a third of it being obscured."""
     if Image is None:
         raise RuntimeError("Pillow is not installed")
     matrix = qr_matrix(payload)
@@ -145,7 +148,36 @@ def render(payload: str, out_path: Path) -> None:
         draw.rounded_rectangle((x + m, y + m, x + 6 * m - 1, y + 6 * m - 1), radius=int(1.0 * m), fill=bg)
         draw.rounded_rectangle((x + 2 * m, y + 2 * m, x + 5 * m - 1, y + 5 * m - 1), radius=int(0.7 * m), fill=accent2)
 
+    s_icon = int(_ICON_FRACTION * n * m)
+    cx = cy = side // 2
+    draw.rounded_rectangle(
+        (cx - s_icon // 2 - m, cy - s_icon // 2 - m, cx + s_icon // 2 + m, cy + s_icon // 2 + m),
+        radius=int(0.2 * s_icon), fill=bg,
+    )
+    _draw_icici_icon(draw, cx, cy, s_icon, accent, accent2, fg)
+
     canvas.resize((total * m_final, total * m_final), Image.BOX).save(out_path, format="PNG")
+
+
+def _draw_icici_icon(d, cx, cy, s, red, orange, mark) -> None:
+    """The centre-plate mark: a two-tone circle (red upper-right, orange
+    lower-left — `pieslice`, not a gradient PIL can't do cheaply) with a
+    white dot-and-stem "i" on top, both built from plain primitives rather
+    than IciciLogo.qml's curved path. The same kind of simplification
+    HDFC's own `_draw_hdfc_icon` makes for its brackets: close enough at
+    the size this is shown, not a faithful trace."""
+    r = int(0.47 * s)
+    d.ellipse((cx - r, cy - r, cx + r, cy + r), fill=orange)
+    d.pieslice((cx - r, cy - r, cx + r, cy + r), start=-78, end=42, fill=red)
+
+    dot_r = int(0.11 * s)
+    dot_cx, dot_cy = cx + int(0.03 * s), cy - int(0.26 * s)
+    d.ellipse((dot_cx - dot_r, dot_cy - dot_r, dot_cx + dot_r, dot_cy + dot_r), fill=mark)
+
+    stem_w = int(0.20 * s)
+    x0, y0 = cx - stem_w // 2 + int(0.01 * s), dot_cy + int(0.14 * s)
+    x1, y1 = x0 + stem_w, cy + int(0.36 * s)
+    d.rounded_rectangle((x0, y0, x1, y1), radius=stem_w // 2, fill=mark)
 
 
 def publish(png: bytes) -> Path | None:
